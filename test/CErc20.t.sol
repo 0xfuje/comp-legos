@@ -8,12 +8,15 @@ import { Comptroller } from "../src/interfaces/Comptroller.sol";
 import { PriceFeed } from "../src/interfaces/PriceFeed.sol";
 
 contract BaseCErc20Test is Test {
-    IERC20 token;
-    CErc20 cToken;
+    IERC20 token;       // DAI
+    CErc20 cToken;      // CDAI
+    IERC20 WBTC;
+    CErc20 CWBTC;
     Comptroller troll = Comptroller(0x3d9819210A31b4961b30EF54bE2aeD79B9c9Cd3B);
     PriceFeed priceFeed = PriceFeed(0x922018674c12a7F0D394ebEEf9B58F186CdE13c1);
 
     address alice = vm.addr(1);
+    address liquidatooor = vm.addr(2);
 
     address constant DAI_ADDRESS = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
     address constant CDAI_ADDRESS = 0x5d3a536E4D6DbD6114cc1Ead35777bAB948E3643;
@@ -24,7 +27,10 @@ contract BaseCErc20Test is Test {
     function setUp() public {
         token = IERC20(DAI_ADDRESS);
         cToken = CErc20(CDAI_ADDRESS);
+        WBTC = IERC20(WBTC_ADDRESS);
+        CWBTC = CErc20(CWBTC_ADDRESS);
         deal(DAI_ADDRESS, alice, 10000 * 1e18);
+        deal(DAI_ADDRESS, liquidatooor, 5000 * 1e18);
         deal(WBTC_ADDRESS, alice, 10 * 1e8);
     }
 }
@@ -82,12 +88,9 @@ contract BorrowTest is BaseCErc20Test {
     function testBorrow() public {
         // MINT CWBTC
         vm.startPrank(alice);
-        IERC20 WBTC = IERC20(WBTC_ADDRESS);
-        CErc20 CWBTC = CErc20(CWBTC_ADDRESS);
         WBTC.approve(address(CWBTC), 10 * 1e8);
         CWBTC.mint(10 * 1e8);
-        emit log_uint(CWBTC.balanceOf(alice));
-
+        
         // BORROW DAI
         // 1. call enter markets on comptroller with minted token
         address[] memory cTokens = new address[](1);
@@ -115,5 +118,55 @@ contract BorrowTest is BaseCErc20Test {
         uint borrowAmount = (maxBorrowTokens * 50) / 100;
         uint errCode = cToken.borrow(borrowAmount);
         assertEq(errCode, 0, "error: during call to CDAI.borrow");
+    }
+}
+
+contract LiquidationTest is BaseCErc20Test {
+    function testLiquidate() public {
+        // MINT CWBTC
+        vm.startPrank(alice);
+        WBTC.approve(address(CWBTC), 10 * 1e8);
+        CWBTC.mint(10 * 1e8);
+
+        // ENTER MARKET
+        address[] memory cTokens = new address[](1);
+        cTokens[0] = CWBTC_ADDRESS;
+        uint[] memory errs = troll.enterMarkets(cTokens);
+        assertEq(errs[0], 0, "error: during call to comptroller.enterMarkets");
+
+        // BORROW DAI
+        (, uint liquidity, ) = troll.getAccountLiquidity(alice);
+        uint daiPrice = priceFeed.getUnderlyingPrice(CDAI_ADDRESS);
+        uint borrowAmount = (liquidity * 1e18 / daiPrice) * 9997 / 10000;
+        cToken.borrow(borrowAmount);
+        vm.stopPrank();
+
+        uint borrowBalBefore = cToken.borrowBalanceCurrent(alice);
+        vm.roll(block.number + 10000);
+        uint borrowBalAfter = cToken.borrowBalanceCurrent(alice);
+
+        assertGt(borrowBalAfter, borrowBalBefore, 
+        "error: borrow balance after rolling block.number has to be more than before");
+
+        // LIQUIDATOOOR
+        vm.startPrank(liquidatooor);
+        // 1. calculate amount to be liquidated
+        uint closeFactor = troll.closeFactorMantissa();
+        uint repayAmount = cToken.borrowBalanceCurrent(alice) * closeFactor;
+        (uint err, uint amountToBeLiquidated) = troll.liquidateCalculateSeizeTokens(
+            CDAI_ADDRESS,        // cTokenBorrowed
+            CWBTC_ADDRESS,       // cTokenCollateral
+            repayAmount          // actualRepayAmount
+        );
+        emit log_uint(closeFactor);
+        emit log_uint(repayAmount);
+        emit log_uint(amountToBeLiquidated);
+        assertEq(err, 0);
+        assertGt(amountToBeLiquidated, 0, "error: amountToBeLiquidated has to be more than 0");
+        
+        // 2. liquidate borrowed asset
+        token.approve(address(cToken), repayAmount);
+        uint errCode = cToken.liquidateBorrow(alice, repayAmount, CDAI_ADDRESS);
+        assertEq(errCode, 0, "error: liquidateBorrow has failed");
     }
 }
